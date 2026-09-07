@@ -1,5 +1,0 @@
-# The core project uses Python standard library only.
-# Optional runtime dependencies are external services:
-# - Ollama for local Qwen models
-# - DeepSeek or Gemini compatible cloud APIs
-
