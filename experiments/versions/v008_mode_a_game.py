@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""Mode A hybrid grid world: periodic cloud planning plus local execution."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import json
+import os
+import sys
+from typing import Optional, Tuple
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+
+class MemoryTool:
+    """Episodic memory that records observations without storing coordinates."""
+
+    def __init__(self) -> None:
+        self.entries: list[str] = []
+
+    def remember(self, entry: str) -> None:
+        self.entries.append(entry)
+
+    def recall(self, limit: int = 20) -> str:
+        if not self.entries:
+            return "暂无行动记忆。"
+        return "\n".join(f"{index + 1}. {entry}" for index, entry in
+                         enumerate(self.entries[-limit:]))
+
+
+class SpatialMemory:
+    """Build a relative map exclusively from executed actions and observations."""
+
+    offsets = {"上": (0, -1), "下": (0, 1), "左": (-1, 0), "右": (1, 0)}
+
+    def __init__(self) -> None:
+        self.position = (0, 0)
+        self.visits = {(0, 0): 1}
+        self.blocked: dict[tuple[int, int], str] = {}
+        self.discoveries: dict[tuple[int, int], str] = {}
+
+    def observe(self, action: str, direction: Optional[str], result: str) -> None:
+        if action == "move" and direction in self.offsets:
+            dx, dy = self.offsets[direction]
+            destination = (self.position[0] + dx, self.position[1] + dy)
+            if result in {"那里超出了地图。", "前面是一堵墙。"}:
+                self.blocked[destination] = "边界" if result == "那里超出了地图。" else "墙"
+            elif result == f"移动{direction}成功。" or result.startswith("移动成功。"):
+                self.position = destination
+                self.visits[destination] = self.visits.get(destination, 0) + 1
+        if "已到达箱子所在位置" in result:
+            self.discoveries[self.position] = "箱子（未打开）"
+        if result == "你打开了箱子，获得了钥匙。":
+            self.discoveries[self.position] = "箱子（已打开）"
+
+    def recall(self) -> str:
+        neighbors = {}
+        for direction, (dx, dy) in self.offsets.items():
+            point = (self.position[0] + dx, self.position[1] + dy)
+            neighbors[direction] = self.blocked.get(point, (
+                f"走过 {self.visits[point]} 次" if point in self.visits else "未知，尚未探索"))
+        return json.dumps({
+            "说明": "坐标相对本轮起点；右为x正方向，下为y正方向；只记录亲自走过或碰撞发现的信息。",
+            "当前位置": self.position,
+            "当前四邻": neighbors,
+            "已访问": [{"位置": p, "次数": n} for p, n in self.visits.items()],
+            "已知阻挡": [{"位置": p, "类型": t} for p, t in self.blocked.items()],
+            "已发现目标": [{"位置": p, "目标": t} for p, t in self.discoveries.items()],
+        }, ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    provider: str = "ollama"
+    model: str = "qwen2.5:3b"
+    api_key: Optional[str] = None
+
+
+@dataclass
+class HighLevelGuide:
+    """Low-frequency cloud guidance for the local step-by-step model."""
+
+    strategy: str = ""
+    priority_directions: list[str] = field(default_factory=list)
+    avoid: list[str] = field(default_factory=list)
+    stop_conditions: list[str] = field(default_factory=list)
+    issued_at_step: int = 0
+    expires_at_step: int = 0
+    trigger: str = ""
+    raw_output: str = ""
+
+    def active_prompt(self, step: int) -> str:
+        if not self.strategy or step > self.expires_at_step:
+            return "暂无云端高层策略。请按空间记忆自行探索。"
+        return json.dumps({
+            "来源": "云端高智慧模型给本地低智慧模型的临时策略，不是地图真值。",
+            "触发原因": self.trigger,
+            "策略": self.strategy,
+            "优先方向": self.priority_directions,
+            "避免": self.avoid,
+            "停止条件": self.stop_conditions,
+            "有效步数": f"第 {self.issued_at_step + 1} 步到第 {self.expires_at_step} 步",
+        }, ensure_ascii=False)
+
+
+def build_model_config(provider: str, model: Optional[str] = None) -> ModelConfig:
+    """Resolve model settings without embedding API keys in source code."""
+    provider = provider.lower()
+    defaults = {
+        "ollama": "qwen2.5:3b",
+        "deepseek": "deepseek-v4-pro",
+        "gemini": "gemini-3.8-flash",
+    }
+    if provider not in defaults:
+        raise ValueError(f"不支持的模型供应商：{provider}")
+
+    # API key 输入位置：
+    #   DeepSeek: export DEEPSEEK_API_KEY="你的 DeepSeek API key"
+    #   Gemini:   export GEMINI_API_KEY="你的 Gemini API key"
+    key_env = {
+        "deepseek": "DEEPSEEK_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+    }.get(provider)
+    api_key = os.getenv(key_env) if key_env else None
+    return ModelConfig(provider=provider, model=model or defaults[provider], api_key=api_key)
+
+
+def call_chat_model(
+    messages: list[dict[str, str]],
+    config: ModelConfig,
+    *,
+    json_mode: bool = True,
+    max_tokens: int = 80,
+) -> str:
+    """Call Ollama, DeepSeek, or Gemini through a small HTTP adapter."""
+    if config.provider == "ollama":
+        payload = {
+            "model": config.model,
+            "stream": False,
+            "format": "json" if json_mode else None,
+            "options": {"temperature": 0, "num_predict": max_tokens},
+            "messages": messages,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        request = Request(
+            "http://127.0.0.1:11434/api/chat",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        return body["message"]["content"]
+
+    if not config.api_key:
+        env_name = "DEEPSEEK_API_KEY" if config.provider == "deepseek" else "GEMINI_API_KEY"
+        raise RuntimeError(f"缺少 API key。请先设置环境变量：export {env_name}='你的 API key'")
+
+    if config.provider == "deepseek":
+        endpoint = "https://api.deepseek.com/chat/completions"
+    else:
+        endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+    payload = {
+        "model": config.model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    if config.provider == "deepseek":
+        # DeepSeek's newer models may emit reasoning separately; keep content JSON-only.
+        payload["thinking"] = {"type": "disabled"}
+
+    request = Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.api_key}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{config.provider} API 请求失败：{error.code} {detail}") from error
+    message = body["choices"][0]["message"]
+    content = message.get("content") or ""
+    if not content.strip() and message.get("reasoning_content"):
+        content = message["reasoning_content"]
+    if not content.strip():
+        raise RuntimeError(f"{config.provider} 返回了空内容：{json.dumps(message, ensure_ascii=False)[:500]}")
+    return content
+
+
+def parse_json_object(raw_output: str) -> dict:
+    """Parse strict JSON, or extract the first JSON object from a chatty response."""
+    text = raw_output.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and start < end:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def normalize_directions(values: object) -> list[str]:
+    aliases = {
+        "上": "上", "up": "上", "north": "上",
+        "下": "下", "down": "下", "south": "下",
+        "左": "左", "left": "左", "west": "左",
+        "右": "右", "right": "右", "east": "右",
+    }
+    if not isinstance(values, list):
+        return []
+    normalized = []
+    for value in values:
+        if isinstance(value, str) and value in aliases and aliases[value] not in normalized:
+            normalized.append(aliases[value])
+    return normalized
+
+
+@dataclass
+class World:
+    width: int = 9
+    height: int = 7
+    player: tuple[int, int] = (1, 5)
+    objects: dict[str, tuple[int, int]] = field(default_factory=lambda: {
+        "chest": (3, 3),
+        "guard": (6, 2),
+        "door": (7, 1),
+    })
+    walls: set[tuple[int, int]] = field(default_factory=lambda: {
+        (2, 1), (2, 2), (2, 3), (5, 3), (5, 4), (5, 5),
+    })
+    inventory: set[str] = field(default_factory=set)
+    chest_open: bool = False
+    door_open: bool = False
+    log: list[str] = field(default_factory=list)
+    memory: MemoryTool = field(default_factory=MemoryTool)
+    spatial_memory: SpatialMemory = field(default_factory=SpatialMemory)
+
+    def render(self) -> str:
+        symbols = {"chest": "C", "guard": "N", "door": "D"}
+        lines = []
+        for y in range(self.height):
+            row = []
+            for x in range(self.width):
+                pos = (x, y)
+                if pos == self.player:
+                    row.append("@")
+                elif pos in self.walls:
+                    row.append("#")
+                elif pos == self.objects["chest"] and not self.chest_open:
+                    row.append("C")
+                elif pos == self.objects["door"] and not self.door_open:
+                    row.append("D")
+                else:
+                    item = next((name for name, location in self.objects.items()
+                                 if location == pos and name == "guard"), None)
+                    row.append(symbols[item] if item else ".")
+            lines.append("".join(row))
+        return "\n".join(lines)
+
+    def describe(self) -> str:
+        nearby = []
+        for name, location in self.objects.items():
+            distance = abs(location[0] - self.player[0]) + abs(location[1] - self.player[1])
+            if distance <= 2 and not (name == "chest" and self.chest_open):
+                nearby.append(name)
+        found = ", ".join(nearby) if nearby else "没有明显目标"
+        bag = ", ".join(sorted(self.inventory)) if self.inventory else "空"
+        return f"你在 {self.player}。附近：{found}。背包：{bag}。"
+
+    def state_for_model(self) -> str:
+        """Return partial observability: never expose map or any coordinates."""
+        return json.dumps({
+            "inventory": sorted(self.inventory),
+            "chest_open": self.chest_open,
+            "door_open": self.door_open,
+            "available_actions": self.available_actions(),
+        }, ensure_ascii=False)
+
+    def available_actions(self) -> list[str]:
+        if self.player == self.objects["chest"] and not self.chest_open:
+            return ["move", "interact"]
+        return ["move"]
+
+    def capability_prompt(self) -> str:
+        if "interact" in self.available_actions():
+            return ('你已到达箱子，发现新能力 interact：打开脚下箱子。'
+                    '当前 action 可以是 move 或 interact。使用 {"action":"interact"} 可完成目标。'
+                    '请自行选择下一步。')
+        return '当前唯一能力是 move，只能选择移动。action 必须是 move。'
+
+    def execute_agent_action(self, action: str, direction: Optional[str]) -> str:
+        if action not in self.available_actions():
+            return "动作不可用，未执行，你仍在原地。" + self.capability_prompt()
+        if action == "move":
+            if direction not in {"上", "下", "左", "右"}:
+                return "方向无效，未执行，你仍在原地。"
+            return self.move(direction)
+        return self.interact()
+
+    def goal_state(self) -> str:
+        status = "已打开" if self.chest_open else "未打开"
+        return f"目标：找到并打开箱子。箱子状态：{status}。你不知道真实地图与绝对坐标，只能通过动作结果和探索所得的相对地图行动。"
+
+    def move(self, direction: str) -> str:
+        offsets = {"上": (0, -1), "下": (0, 1), "左": (-1, 0), "右": (1, 0)}
+        dx, dy = offsets[direction]
+        target = (self.player[0] + dx, self.player[1] + dy)
+        if not (0 <= target[0] < self.width and 0 <= target[1] < self.height):
+            return "那里超出了地图。"
+        if target in self.walls:
+            return "前面是一堵墙。"
+        self.player = target
+        if target == self.objects["chest"] and not self.chest_open:
+            return "移动成功。你已到达箱子所在位置。【下一步】请立即执行交互以打开箱子。"
+        return f"移动{direction}成功。"
+
+    def interact(self, target: Optional[str] = None) -> str:
+        if target is None:
+            nearby = [
+                name for name, location in self.objects.items()
+                if location == self.player
+            ]
+            if not nearby:
+                return "附近没有可以交互的对象。"
+            target = nearby[0]
+        location = self.objects.get(target)
+        if location is None:
+            return f"找不到目标：{target}。"
+        if location != self.player:
+            return "这里没有可交互的目标。"
+        if target == "chest":
+            if self.chest_open:
+                return "箱子已经打开了。"
+            self.chest_open = True
+            self.inventory.add("key")
+            return "你打开了箱子，获得了钥匙。"
+        if target == "door":
+            if "key" not in self.inventory:
+                return "门锁着，你需要一把钥匙。"
+            self.door_open = True
+            return "你用钥匙打开了门。"
+        if target == "guard":
+            return "卫兵说：城门后面藏着一座古老的图书馆。"
+        return "没有发生什么。"
+
+
+def parse_command(text: str) -> Tuple[str, Optional[str]]:
+    text = text.strip().lower()
+    directions = {"上": "上", "北": "上", "下": "下", "南": "下",
+                  "左": "左", "西": "左", "右": "右", "东": "右"}
+    for word, direction in directions.items():
+        if word in text and any(mark in text for mark in ("走", "移动", "去", "move")):
+            return "move", direction
+    if text in {"交互", "互动", "interact"}:
+        return "interact", None
+    if any(word in text for word in ("观察", "看看", "附近", "look", "describe")):
+        return "describe", None
+    return "help", None
+
+
+def parse_with_ai(text: str, world: World, config: ModelConfig) -> Tuple[str, Optional[str]]:
+    """Ask a chat model for one safe game action, falling back to local parsing on errors."""
+    system = (
+        "你是一个网格游戏指令解析器。只输出一个JSON对象，不要解释。"
+        "action只能是move、interact、describe、help；"
+        "move时direction只能是上、下、左、右；其他动作target必须为null。"
+    )
+    try:
+        raw_output = call_chat_model(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"当前状态：{world.state_for_model()}\n玩家输入：{text}"},
+            ],
+            config,
+            max_tokens=40,
+        )
+        print(f"[{config.provider}:{config.model} 输出] {raw_output}")
+        result = parse_json_object(raw_output)
+        action = result.get("action")
+        direction = result.get("direction")
+        direction_aliases = {"上": "上", "north": "上", "up": "上",
+                             "下": "下", "south": "下", "down": "下",
+                             "左": "左", "west": "左", "left": "左",
+                             "右": "右", "east": "右", "right": "右"}
+        if action == "move" and direction in direction_aliases:
+            return "move", direction_aliases[direction]
+        if action in {"interact", "describe", "help"}:
+            return action, None
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(f"[模型不可用，使用本地解析器：{error}]", file=sys.stderr)
+    return parse_command(text)
+
+
+def agent_step(
+    world: World,
+    config: ModelConfig,
+    feedback: str = "",
+    strategy_context: str = "",
+) -> Tuple[str, Optional[str], str, str]:
+    """Choose one executable step and return its action, explanation, and reason."""
+    system = (
+        "你是一个网格游戏解题Agent。目标是找到并打开箱子。"
+        "每次只能选择一个动作。只输出JSON，不要输出Markdown。"
+        "只能使用当前开放的能力；move的direction只能是上、下、左、右。"
+        "explanation必须是简短中文行动说明，不超过30字。"
+        "reason必须解释为什么选择这个方向，基于上一步反馈或探索策略，不超过50字。"
+        "你无法看到地图，必须通过移动结果探索；遇到阻挡后尝试其他方向。"
+        "如果上一条环境反馈说某方向越界或撞墙，下一步绝对禁止再次选择该方向。"
+        "必须真正改变方向，而不是重复解释同一个失败动作。"
+        "你拥有行动记忆，必须读取记忆，避免重复已经失败或反复走过的动作。"
+        "空间记忆是根据实际执行结果维护的相对地图。优先探索未知方向，避开已知阻挡。"
+        "没有未知出口时可以回访已走过的格子寻找其他出口。未知不代表可通行。下一步由你决定。"
+        "如果收到云端高层策略，请优先参考它，但你仍然只能输出当前一步动作。"
+        "默认探索原则：除已发现的箱子位置外，尽可能降低每个位置的访问次数。"
+        "选择方向时，第一优先访问次数为0的未知相邻位置；如果没有未知相邻位置，"
+        "选择访问次数最低的可通行相邻位置。不要反复往返高访问次数的位置。"
+    )
+    system += world.capability_prompt()
+    try:
+        raw_output = call_chat_model(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"{world.goal_state()}\n状态：{world.state_for_model()}\n"
+                 f"上一步结果：{feedback or '这是第一步'}\n行动记忆：\n{world.memory.recall()}\n"
+                 f"空间记忆：\n{world.spatial_memory.recall()}\n"
+                 f"云端高层策略：\n{strategy_context or '暂无云端高层策略。'}"},
+            ],
+            config,
+            max_tokens=120,
+        )
+        print(f"[{config.provider}:{config.model} 输出] {raw_output}")
+        result = parse_json_object(raw_output)
+        action = result.get("action")
+        direction_aliases = {"上": "上", "up": "上", "north": "上",
+                             "下": "下", "down": "下", "south": "下",
+                             "左": "左", "left": "左", "west": "左",
+                             "右": "右", "right": "右", "east": "右"}
+        direction = result.get("direction")
+        # Small models sometimes combine the action and direction into one field.
+        if isinstance(action, str) and action.startswith("move"):
+            combined_direction = action[4:].strip(" ：:，,")
+            if direction is None and combined_direction:
+                direction = combined_direction
+            action = "move"
+        if action == "move" and direction in direction_aliases:
+            return ("move", direction_aliases[direction],
+                    result.get("explanation", ""), result.get("reason", ""))
+        if action == "interact":
+            return ("interact", None, result.get("explanation", ""),
+                    result.get("reason", ""))
+        raise ValueError("模型返回了无效动作")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(f"[Agent 错误] {error}")
+        return "help", None, "", ""
+
+
+def build_feedback(action: str, target: Optional[str], result: str, world: World) -> str:
+    if action == "move" and result == "那里超出了地图。":
+        return (f"【环境反馈】你刚才选择了向{target}移动，但该方向超出边界，"
+                f"玩家位置没有改变。\n【下一步约束】禁止再次向{target}移动。"
+                "请结合行动记忆，自己选择其他方向。")
+    if action == "move" and result == "前面是一堵墙。":
+        return (f"【环境反馈】你刚才选择了向{target}移动，但前方是墙，"
+                f"玩家位置没有改变。\n【下一步约束】禁止再次向{target}移动。"
+                "请结合行动记忆，自己选择其他方向。")
+    if "已到达箱子所在位置" in result:
+        return "【能力发现】" + world.capability_prompt()
+    return f"【环境反馈】你刚才的动作结果是：{result} 请继续自行决定下一步。"
+
+
+def detect_stuck(history: list[dict[str, object]]) -> Optional[str]:
+    """Detect when the local model should ask the cloud model for guidance."""
+    if not history:
+        return None
+
+    last = history[-1]
+    last_result = str(last["result"])
+    if "动作不可用" in last_result or "方向无效" in last_result:
+        return "本地模型给出了不可执行动作。"
+
+    blocked_results = {"那里超出了地图。", "前面是一堵墙。"}
+    if len(history) >= 2 and all(str(item["result"]) in blocked_results for item in history[-2:]):
+        return "本地模型连续两步撞墙或越界。"
+
+    recent = history[-8:]
+    if len(recent) >= 8:
+        unique_positions = {tuple(item["relative_position"]) for item in recent}
+        if len(unique_positions) <= 3:
+            return f"最近 8 步只覆盖 {len(unique_positions)} 个相对位置，疑似局部循环。"
+
+    recent_six = history[-6:]
+    if len(recent_six) >= 6:
+        unique_positions = {tuple(item["relative_position"]) for item in recent_six}
+        if len(unique_positions) <= 2:
+            return "最近 6 步在极少数位置之间往返，疑似振荡。"
+
+    return None
+
+
+def request_high_level_guide(
+    world: World,
+    cloud_config: ModelConfig,
+    trigger: str,
+    step: int,
+    history: list[dict[str, object]],
+) -> HighLevelGuide:
+    system = (
+        "你是云端高智慧导航策略器。你的任务不是直接控制角色每一步，"
+        "而是在本地低智慧模型卡住时，给它一段短期探索策略。"
+        "你看不到真实地图、真实墙体坐标、真实箱子坐标或真实玩家坐标。"
+        "你只能使用相对空间记忆、最近执行结果和行动记忆。"
+        "只输出JSON，不要Markdown。"
+        "JSON字段：strategy字符串；priority_directions数组，只能包含上、下、左、右；"
+        "avoid数组；stop_conditions数组；action_budget整数，建议4到8。"
+        "不要输出单步动作，不要假设目标坐标。"
+    )
+    recent_events = [
+        {
+            "step": item["step"],
+            "action": item["action"],
+            "direction": item["target"],
+            "result": item["result"],
+            "relative_position": item["relative_position"],
+        }
+        for item in history[-10:]
+    ]
+    user = json.dumps({
+        "目标": world.goal_state(),
+        "触发原因": trigger,
+        "当前开放能力": world.available_actions(),
+        "行动记忆": world.memory.recall(),
+        "空间记忆": json.loads(world.spatial_memory.recall()),
+        "最近事件": recent_events,
+        "要求": "给本地模型一段短期策略，帮助它跳出卡住状态并继续探索未知区域。",
+    }, ensure_ascii=False)
+
+    raw_output = call_chat_model(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        cloud_config,
+        max_tokens=220,
+    )
+    print(f"[云端策略器 {cloud_config.provider}:{cloud_config.model} 输出] {raw_output}")
+    result = parse_json_object(raw_output)
+    budget = result.get("action_budget", 6)
+    if not isinstance(budget, int):
+        budget = 6
+    budget = max(2, min(10, budget))
+    return HighLevelGuide(
+        strategy=str(result.get("strategy", "优先探索未知方向，避开已知阻挡。")),
+        priority_directions=normalize_directions(result.get("priority_directions", [])),
+        avoid=[str(item) for item in result.get("avoid", [])] if isinstance(result.get("avoid", []), list) else [],
+        stop_conditions=[str(item) for item in result.get("stop_conditions", [])]
+        if isinstance(result.get("stop_conditions", []), list) else [],
+        issued_at_step=step,
+        expires_at_step=step + budget,
+        trigger=trigger,
+        raw_output=raw_output,
+    )
+
+
+def request_periodic_plan(
+    world: World,
+    cloud_config: ModelConfig,
+    step: int,
+    plan_interval: int,
+    history: list[dict[str, object]],
+) -> HighLevelGuide:
+    system = (
+        "你是云端高智慧导航规划器。你每隔固定步数为本地低智慧模型制定一次短期探索计划。"
+        "你的任务是高层规划，不是直接控制每一步。"
+        "你看不到真实地图、真实墙体坐标、真实箱子坐标或真实玩家坐标。"
+        "你只能使用相对空间记忆、行动记忆和最近执行结果。"
+        "只输出JSON，不要Markdown。"
+        "JSON字段：strategy字符串；priority_directions数组，只能包含上、下、左、右；"
+        "avoid数组；stop_conditions数组；action_budget整数，必须等于本轮计划窗口步数。"
+        "策略要帮助本地模型优先探索未知区域、减少重复访问、避开已知阻挡。"
+    )
+    recent_events = [
+        {
+            "step": item["step"],
+            "action": item["action"],
+            "direction": item["target"],
+            "result": item["result"],
+            "relative_position": item["relative_position"],
+        }
+        for item in history[-12:]
+    ]
+    user = json.dumps({
+        "目标": world.goal_state(),
+        "规划类型": "模式A：固定间隔高层规划",
+        "当前步数": step,
+        "计划窗口": plan_interval,
+        "当前开放能力": world.available_actions(),
+        "行动记忆": world.memory.recall(),
+        "空间记忆": json.loads(world.spatial_memory.recall()),
+        "最近事件": recent_events,
+        "要求": (
+            "制定接下来若干步的探索方针。不要假设目标坐标；"
+            "如果发现箱子或开放 interact，本地模型应立即停止移动并交互。"
+        ),
+    }, ensure_ascii=False)
+
+    raw_output = call_chat_model(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        cloud_config,
+        max_tokens=240,
+    )
+    print(f"[周期云端规划器 {cloud_config.provider}:{cloud_config.model} 输出] {raw_output}")
+    result = parse_json_object(raw_output)
+    budget = result.get("action_budget", plan_interval)
+    if not isinstance(budget, int):
+        budget = plan_interval
+    budget = max(1, min(20, budget))
+    return HighLevelGuide(
+        strategy=str(result.get("strategy", "优先探索未知方向，避开已知阻挡。")),
+        priority_directions=normalize_directions(result.get("priority_directions", [])),
+        avoid=[str(item) for item in result.get("avoid", [])] if isinstance(result.get("avoid", []), list) else [],
+        stop_conditions=[str(item) for item in result.get("stop_conditions", [])]
+        if isinstance(result.get("stop_conditions", []), list) else [],
+        issued_at_step=step - 1,
+        expires_at_step=step + budget - 1,
+        trigger=f"模式A固定间隔规划：第 {step} 步",
+        raw_output=raw_output,
+    )
+
+
+def solve_chest_with_ai(world: World, config: ModelConfig, max_steps: int = 100) -> None:
+    print("\n=== AI 自动解题：找到并打开箱子 ===")
+    print(f"[模型] provider={config.provider}, model={config.model}")
+    feedback = ""
+    for step in range(1, max_steps + 1):
+        if world.chest_open:
+            print(f"[完成] 第 {step - 1} 步：箱子已打开，获得钥匙。")
+            return
+        action, target, explanation, reason = agent_step(world, config, feedback)
+        print(f"[第 {step} 步] {explanation}")
+        print(f"[选择理由] {reason}")
+        result = world.execute_agent_action(action, target)
+        world.spatial_memory.observe(action, target, result)
+        print(f"[空间记忆] {world.spatial_memory.recall()}")
+        print(f"[执行结果] {result}")
+        if action == "move" and result == "那里超出了地图。":
+            feedback = (f"【环境反馈】你刚才选择了向{target}移动，但该方向超出边界，"
+                        f"玩家位置没有改变。\n【下一步约束】禁止再次向{target}移动。"
+                        "请结合行动记忆，自己选择其他方向。")
+        elif action == "move" and result == "前面是一堵墙。":
+            feedback = (f"【环境反馈】你刚才选择了向{target}移动，但前方是墙，"
+                        f"玩家位置没有改变。\n【下一步约束】禁止再次向{target}移动。"
+                        "请结合行动记忆，自己选择其他方向。")
+        elif "已到达箱子所在位置" in result:
+            feedback = "【能力发现】" + world.capability_prompt()
+        else:
+            feedback = f"【环境反馈】你刚才的动作结果是：{result} 请继续自行决定下一步。"
+        print(f"[发送给 Agent 的反馈] {feedback}")
+        world.memory.remember(f"选择：{action} {target or ''}；{feedback}")
+        print(f"[记忆] 已保存，当前 {len(world.memory.entries)} 条")
+        print(world.render())
+        if world.chest_open:
+            print(f"[完成] 第 {step} 步：箱子已打开，获得钥匙。")
+            return
+    print("[停止] 超过最大步数，未能完成目标。")
+
+
+def solve_chest_with_hybrid_models(
+    world: World,
+    local_config: ModelConfig,
+    cloud_config: ModelConfig,
+    max_steps: int = 100,
+    cloud_cooldown: int = 4,
+) -> None:
+    print("\n=== 混合 Agent：本地低智慧模型执行，云端高智慧模型卡住时引导 ===")
+    print(f"[本地执行模型] provider={local_config.provider}, model={local_config.model}")
+    print(f"[云端策略模型] provider={cloud_config.provider}, model={cloud_config.model}")
+    print("[架构] 每一步动作由本地模型输出；云端模型只在卡住检测触发后提供短期策略。")
+
+    feedback = ""
+    guide = HighLevelGuide()
+    history: list[dict[str, object]] = []
+    cloud_calls = 0
+    next_cloud_step = 1
+
+    for step in range(1, max_steps + 1):
+        if world.chest_open:
+            print(f"[完成] 第 {step - 1} 步：箱子已打开，获得钥匙。")
+            print(f"[云端调用次数] {cloud_calls}")
+            return
+
+        strategy_prompt = guide.active_prompt(step)
+        print(f"[第 {step} 步策略上下文] {strategy_prompt}")
+        action, target, explanation, reason = agent_step(
+            world,
+            local_config,
+            feedback,
+            strategy_prompt,
+        )
+        print(f"[第 {step} 步] {explanation}")
+        print(f"[本地模型选择理由] {reason}")
+        result = world.execute_agent_action(action, target)
+        world.spatial_memory.observe(action, target, result)
+        print(f"[空间记忆] {world.spatial_memory.recall()}")
+        print(f"[执行结果] {result}")
+
+        feedback = build_feedback(action, target, result, world)
+        print(f"[发送给本地模型的反馈] {feedback}")
+        world.memory.remember(f"选择：{action} {target or ''}；{feedback}")
+        print(f"[记忆] 已保存，当前 {len(world.memory.entries)} 条")
+
+        history.append({
+            "step": step,
+            "action": action,
+            "target": target,
+            "result": result,
+            "relative_position": world.spatial_memory.position,
+        })
+
+        print(world.render())
+        if world.chest_open:
+            print(f"[完成] 第 {step} 步：箱子已打开，获得钥匙。")
+            print(f"[云端调用次数] {cloud_calls}")
+            return
+
+        trigger = detect_stuck(history)
+        if trigger and step >= next_cloud_step and "interact" not in world.available_actions():
+            print(f"[卡住检测] {trigger}")
+            try:
+                guide = request_high_level_guide(world, cloud_config, trigger, step, history)
+                cloud_calls += 1
+                next_cloud_step = step + max(1, cloud_cooldown)
+                print(f"[云端策略已更新] {guide.active_prompt(step + 1)}")
+            except (OSError, RuntimeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                next_cloud_step = step + max(1, cloud_cooldown)
+                print(f"[云端策略器错误] {error}")
+
+    print("[停止] 超过最大步数，未能完成目标。")
+    print(f"[云端调用次数] {cloud_calls}")
+
+
+def solve_chest_with_mode_a_models(
+    world: World,
+    local_config: ModelConfig,
+    cloud_config: ModelConfig,
+    max_steps: int = 100,
+    plan_interval: int = 5,
+) -> None:
+    print("\n=== 模式A：云端固定间隔规划，本地模型逐步执行 ===")
+    print(f"[本地执行模型] provider={local_config.provider}, model={local_config.model}")
+    print(f"[云端规划模型] provider={cloud_config.provider}, model={cloud_config.model}")
+    print(f"[规划间隔] 每 {plan_interval} 步规划一次；第 1 步先规划。")
+    print("[架构] DeepSeek 输出短期策略窗口；Qwen 每步依据该策略和空间记忆输出动作。")
+
+    feedback = ""
+    guide = HighLevelGuide()
+    history: list[dict[str, object]] = []
+    cloud_calls = 0
+
+    for step in range(1, max_steps + 1):
+        if world.chest_open:
+            print(f"[完成] 第 {step - 1} 步：箱子已打开，获得钥匙。")
+            print(f"[云端调用次数] {cloud_calls}")
+            return
+
+        should_plan = step == 1 or (step - 1) % max(1, plan_interval) == 0
+        if should_plan and "interact" not in world.available_actions():
+            print(f"[周期规划触发] 第 {step} 步，请求云端制定接下来 {plan_interval} 步策略。")
+            try:
+                guide = request_periodic_plan(world, cloud_config, step, plan_interval, history)
+                cloud_calls += 1
+                print(f"[周期策略已更新] {guide.active_prompt(step)}")
+            except (OSError, RuntimeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                print(f"[周期云端规划器错误] {error}")
+
+        strategy_prompt = guide.active_prompt(step)
+        print(f"[第 {step} 步策略上下文] {strategy_prompt}")
+        action, target, explanation, reason = agent_step(
+            world,
+            local_config,
+            feedback,
+            strategy_prompt,
+        )
+        print(f"[第 {step} 步] {explanation}")
+        print(f"[本地模型选择理由] {reason}")
+
+        result = world.execute_agent_action(action, target)
+        world.spatial_memory.observe(action, target, result)
+        print(f"[空间记忆] {world.spatial_memory.recall()}")
+        print(f"[执行结果] {result}")
+
+        feedback = build_feedback(action, target, result, world)
+        print(f"[发送给本地模型的反馈] {feedback}")
+        world.memory.remember(f"选择：{action} {target or ''}；{feedback}")
+        print(f"[记忆] 已保存，当前 {len(world.memory.entries)} 条")
+
+        history.append({
+            "step": step,
+            "action": action,
+            "target": target,
+            "result": result,
+            "relative_position": world.spatial_memory.position,
+        })
+
+        print(world.render())
+        if world.chest_open:
+            print(f"[完成] 第 {step} 步：箱子已打开，获得钥匙。")
+            print(f"[云端调用次数] {cloud_calls}")
+            return
+
+    print("[停止] 超过最大步数，未能完成目标。")
+    print(f"[云端调用次数] {cloud_calls}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Mode A hybrid text world demo")
+    parser.add_argument("--ai", action="store_true", help="使用模型解析玩家输入")
+    parser.add_argument("--single-solve", action="store_true", help="单模型自动寻找并打开箱子")
+    parser.add_argument("--stuck-solve", action="store_true", help="模式B：仅卡住时请求云端策略")
+    parser.add_argument(
+        "--mode-a-solve",
+        action="store_true",
+        default=True,
+        help="模式A：云端固定间隔规划，本地小模型每步执行；本文件默认启用",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["ollama", "deepseek", "gemini"],
+        default="ollama",
+        help="模型供应商，默认 ollama",
+    )
+    parser.add_argument("--model", help="模型名；默认随 provider 变化")
+    parser.add_argument("--max-steps", type=int, default=100, help="自动解题最大步数")
+    parser.add_argument("--local-provider", choices=["ollama", "deepseek", "gemini"], default="ollama")
+    parser.add_argument("--local-model", default="qwen2.5:1.5b")
+    parser.add_argument("--cloud-provider", choices=["ollama", "deepseek", "gemini"], default="deepseek")
+    parser.add_argument("--cloud-model", help="云端策略模型名；默认随 cloud-provider 变化")
+    parser.add_argument("--cloud-cooldown", type=int, default=4, help="两次云端介入之间的最小步数")
+    parser.add_argument("--plan-interval", type=int, default=5, help="模式A云端规划间隔，默认每5步一次")
+    args = parser.parse_args()
+
+    world = World()
+    use_ai = args.ai
+    single_solve = args.single_solve
+    stuck_solve = args.stuck_solve
+    mode_a_solve = args.mode_a_solve and not single_solve and not stuck_solve and not use_ai
+    config = build_model_config(args.provider, args.model) if use_ai or single_solve else None
+    if config and config.provider != "ollama" and not config.api_key:
+        env_name = "DEEPSEEK_API_KEY" if config.provider == "deepseek" else "GEMINI_API_KEY"
+        parser.error(f"缺少 API key。请先设置环境变量：export {env_name}='你的 API key'")
+
+    local_config = None
+    cloud_config = None
+    if stuck_solve or mode_a_solve:
+        local_config = build_model_config(args.local_provider, args.local_model)
+        cloud_config = build_model_config(args.cloud_provider, args.cloud_model)
+        for role, role_config in (("本地模型", local_config), ("云端模型", cloud_config)):
+            if role_config.provider != "ollama" and not role_config.api_key:
+                env_name = "DEEPSEEK_API_KEY" if role_config.provider == "deepseek" else "GEMINI_API_KEY"
+                parser.error(f"{role}缺少 API key。请先设置环境变量：export {env_name}='你的 API key'")
+
+    if mode_a_solve and local_config and cloud_config:
+        mode = f"mode-a local={local_config.provider}:{local_config.model} cloud={cloud_config.provider}:{cloud_config.model}"
+    elif stuck_solve and local_config and cloud_config:
+        mode = f"mode-b local={local_config.provider}:{local_config.model} cloud={cloud_config.provider}:{cloud_config.model}"
+    else:
+        mode = f"{config.provider}:{config.model}" if config else "本地规则解析器"
+    print(f"Text World Demo | 模式：{mode} | 输入 help 查看命令，输入 quit 退出。\n")
+    print(world.render())
+    if mode_a_solve and local_config and cloud_config:
+        solve_chest_with_mode_a_models(
+            world,
+            local_config,
+            cloud_config,
+            args.max_steps,
+            args.plan_interval,
+        )
+        return
+    if stuck_solve and local_config and cloud_config:
+        solve_chest_with_hybrid_models(
+            world,
+            local_config,
+            cloud_config,
+            args.max_steps,
+            args.cloud_cooldown,
+        )
+        return
+    if single_solve:
+        solve_chest_with_ai(world, config or build_model_config(args.provider, args.model), args.max_steps)
+        return
+    while True:
+        try:
+            text = input("\n你> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if text.strip().lower() in {"quit", "exit", "退出"}:
+            break
+        action, target = parse_with_ai(text, world, config) if use_ai and config else parse_command(text)
+        if action == "move":
+            result = world.move(target)  # type: ignore[arg-type]
+        elif action == "interact":
+            result = world.interact(target)
+        elif action == "describe":
+            result = world.describe()
+        else:
+            result = "可用指令：向上/下/左/右移动；交互；观察；退出。"
+        print(result)
+        print(world.render())
+
+
+if __name__ == "__main__":
+    main()
